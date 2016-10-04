@@ -17,7 +17,7 @@
 // [X] ImGui Controls
 // [X] Add tri-meshes (Shaderball, lucy statue from *.obj)
 // [X] Path tracing (Monte Carlo) + Sampler (random/jittered) structs
-// [ ] Timers for various functions (accel vs non-accel)
+// [X] Timers for various functions (accel vs non-accel)
 // [ ] Proper radiance based materials (bdrf)
 // [X] BVH Accelerator
 // [ ] Cornell Box Loader
@@ -75,11 +75,11 @@ struct Scene
 
 	const int maxRecursion = 5;
 
-	float3 trace_ray(const Ray & ray, float weight, int depth)
+    std::pair<float3, float> trace_ray(const Ray & ray, float weight, int depth)
 	{
 		if (depth >= maxRecursion || weight <= 0.0f)
 		{
-			return float3(0, 0, 0);
+            return {float3(0, 0, 0), 0.f};
 		}
 
 		RayIntersection best;
@@ -97,7 +97,8 @@ struct Scene
 			}
 		}
 		best.location = ray.origin + ray.direction * best.d;
-
+        
+        return {float3(), best.d};
 		// Reasonable/valid ray-material interaction:
 		if (best())
 		{
@@ -112,33 +113,40 @@ struct Scene
 			p = (p != 1.0f) ? p : 0.9999f;
 			if (weight < p)
 			{
-				return (1.0f / p) * best.m->emissive;
+                return {float3((1.0f / p) * best.m->emissive), best.d};
 			}
 
 			Ray reflected = best.m->get_reflected_ray(ray, best.location, best.normal, gen);
 
 			// Fixme - proper radiance
-			return (best.m->emissive) + (Kd * trace_ray(reflected, weight * dMax, depth + 1));
+            return { float3(best.m->emissive + (Kd * trace_ray(reflected, weight * dMax, depth + 1).first)), best.d};
 		}
-		else return weight * environment; // otherwise return environment color
+        else return {weight * environment, best.d}; // otherwise return environment color
 	}
 };
 
 struct Film
 {
-	std::vector<float3> samples;
+	std::vector<float3> color;
+    std::vector<float> depth;
+    
 	int2 size;
 	Pose view;
 	float FoV = ANVIL_PI / 2;
 
-	Film(const int2 & size, const Pose & view) : samples(size.x * size.y), size(size), view(view) { }
+	Film(const int2 & size, const Pose & view) : size(size), view(view)
+    {
+        color.resize(size.x * size.y);
+        depth.resize(size.x * size.y);
+    }
 
 	void set_field_of_view(float degrees) { FoV = std::tan(to_radians(degrees) * 0.5f); }
 
 	void reset(const Pose & newView)
 	{
 		view = newView;
-		std::fill(samples.begin(), samples.end() + 4, float3(0, 0, 0));
+		std::fill(color.begin(), color.end(), float3(0, 0, 0));
+        std::fill(depth.begin(), depth.end(), 0.f);
 	}
 
 	// http://computergraphics.stackexchange.com/questions/2130/anti-aliasing-filtering-in-ray-tracing
@@ -163,12 +171,16 @@ struct Film
 	void trace_samples(Scene & scene, const int2 & coord, float numSamples)
 	{
 		const float invSamples = 1.f / numSamples;
-		float3 sample;
+        float3 colorSample;
+        float depthSample;
 		for (int s = 0; s < numSamples; ++s)
 		{
-			sample = sample + scene.trace_ray(make_ray_for_coordinate(coord), 1.0f, 0);
+            std::pair<float3, float> sample = scene.trace_ray(make_ray_for_coordinate(coord), 1.0f, 0);
+            colorSample += sample.first;
+            depthSample = sample.second;
 		}
-		samples[coord.y * size.x + coord.x] = sample * invSamples;
+		color[coord.y * size.x + coord.x] = colorSample * invSamples;
+        depth[coord.y * size.x + coord.x] = depthSample * invSamples;
 	}
 };
 
@@ -183,9 +195,12 @@ struct ExperimentalApp : public GLFWApp
 {
 	std::unique_ptr<gui::ImGuiManager> igm;
 
-	std::shared_ptr<GlTexture> renderSurface;
-	std::shared_ptr<GLTextureView> renderView;
-
+	std::shared_ptr<GlTexture> colorTexture;
+    std::shared_ptr<GlTexture> depthTexture;
+    
+	std::shared_ptr<GLTextureView> colorView;
+    std::shared_ptr<GLTextureView> depthView;
+    
 	std::shared_ptr<Film> film;
 	Scene scene;
     TimeKeeper sceneTimer;
@@ -282,9 +297,13 @@ struct ExperimentalApp : public GLFWApp
 		}
 
 		// Create a GL texture to which we can render
-		renderSurface.reset(new GlTexture());
-		renderSurface->load_data(WIDTH, HEIGHT, GL_RGB, GL_RGB, GL_FLOAT, nullptr);
-		renderView.reset(new GLTextureView(renderSurface->get_gl_handle(), true));
+		colorTexture.reset(new GlTexture());
+		colorTexture->load_data(WIDTH, HEIGHT, GL_RGB, GL_RGB, GL_FLOAT, nullptr);
+		colorView.reset(new GLTextureView(colorTexture->get_gl_handle(), true));
+        
+        depthTexture.reset(new GlTexture());
+        depthTexture->load_data(WIDTH, HEIGHT, GL_RED, GL_RED, GL_FLOAT, nullptr);
+        depthView.reset(new GLTextureView(depthTexture->get_gl_handle(), true));
         
         sceneTimer.start();
 	}
@@ -376,13 +395,18 @@ struct ExperimentalApp : public GLFWApp
 		int width, height;
 		glfwGetWindowSize(window, &width, &height);
 		glViewport(0, 0, width, height);
+        int2 winSize = {width, height};
 
 		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 		glClearColor(0.f, 0.f, 0.f, 1.0f);
 
-		renderSurface->load_data(WIDTH, HEIGHT, GL_RGB, GL_RGB, GL_FLOAT, film->samples.data());
-		Bounds2D renderArea = { 0, 0, (float)WIDTH, (float)HEIGHT };
-		renderView->draw(renderArea, { width, height });
+		//colorTexture->load_data(WIDTH, HEIGHT, GL_RGB, GL_RGB, GL_FLOAT, film->color.data());
+		//Bounds2D colorArea = { 0, 0, WIDTH, HEIGHT };
+		//colorView->draw(colorArea, winSize);
+        
+        depthTexture->load_data(WIDTH, HEIGHT, GL_RED, GL_RED, GL_FLOAT, film->depth.data());
+        Bounds2D depthArea = { 0, 0, WIDTH, HEIGHT };
+        depthView->draw(depthArea, winSize);
 
 		if (igm) igm->begin_frame();
         ImGui::Text("Application Runtime %.3lld seconds", sceneTimer.seconds().count());
@@ -398,7 +422,7 @@ struct ExperimentalApp : public GLFWApp
 		ImGui::ColorEdit3("Ambient", &scene.ambient[0]);
         for (auto & t : renderTimers)
         {
-            ImGui::Text("%#010x %.3f", t.first, t.second.get());
+            ImGui::Text("Thread: %#010x - %.3f", t.first, t.second.get());
         }
 		if (igm) igm->end_frame();
 
